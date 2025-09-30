@@ -28,14 +28,29 @@ app = FastAPI(title="Pracuj.pl 24h Job Scraper API")
 
 # ---------------- Playwright functions ----------------
 async def start_browser(headless=True):
+    import os
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=headless,
-        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled"
+        ],
     )
-    context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+    context = await browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
+    )
+    # Hide webdriver
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
     page = await context.new_page()
     return playwright, browser, page
+
 
 
 
@@ -59,10 +74,16 @@ async def goto_with_cf(page, url, timeout=60000):
         return False
 
 
-async def get_job_links(page, search_term):
+# replace get_job_links with this version
+async def get_job_links(page, search_term, limit: int | None = None):
     job_urls = []
     term_enc = quote(search_term)
     page_num = 1
+
+    # normalize limit: treat <=0 as "no results"
+    if limit is not None and limit <= 0:
+        logger.info("🔍 limit provided <= 0, returning no job links")
+        return job_urls
 
     while True:
         url = f"{BASE_URL}/praca/{term_enc};kw/ostatnich%2024h;p,{page_num}"
@@ -91,6 +112,10 @@ async def get_job_links(page, search_term):
                 if full_url not in job_urls:
                     job_urls.append(full_url)
                     new_links += 1
+                    # stop early if limit reached
+                    if limit is not None and len(job_urls) >= limit:
+                        logger.info(f"✅ Reached limit of {limit} job links")
+                        return job_urls
 
         if new_links == 0:
             break
@@ -99,6 +124,7 @@ async def get_job_links(page, search_term):
 
     logger.info(f"✅ Found {len(job_urls)} job links in last 24 hours")
     return job_urls
+
 
 
 async def scrape_job(page, url):
@@ -164,17 +190,26 @@ def save_to_excel(jobs, filename):
 
 
 # ---------------- API ROUTE ----------------
+# replace your /scrape route signature and use of get_job_links with this
+from typing import Optional
+
 @app.get("/scrape")
 async def scrape(
     term: str = Query("Mechanik", description="Search term"),
     excel: bool = Query(False, description="Return Excel file"),
-    headless: bool = Query(True, description="Run browser headless")
+    headless: bool = Query(True, description="Run browser headless"),
+    limit: Optional[int] = Query(None, description="Max number of job URLs to scrape (e.g. 10)")
 ):
     playwright, browser, page = await start_browser(headless=headless)
     try:
-        job_urls = await get_job_links(page, term)
+        # pass limit down to get_job_links
+        job_urls = await get_job_links(page, term, limit=limit)
+
         full_results = []
-        for url in job_urls:
+        for idx, url in enumerate(job_urls, start=1):
+            # optional: stop again in case job_urls was modified elsewhere
+            if limit is not None and idx > limit:
+                break
             job = await scrape_job(page, url)
             full_results.append(job)
 
@@ -183,7 +218,8 @@ async def scrape(
 
         if excel:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"jobs_{term}_{ts}.xlsx"
+            safe_term = "".join(c if c.isalnum() else "_" for c in term)[:50]
+            filename = f"jobs_{safe_term}_{ts}.xlsx"
             excel_path = save_to_excel(full_results, filename)
             return FileResponse(
                 path=excel_path,
