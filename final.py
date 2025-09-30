@@ -31,11 +31,12 @@ async def start_browser(headless=True):
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=headless,
-        args=["--disable-blink-features=AutomationControlled"]
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
     )
     context = await browser.new_context(viewport={"width": 1920, "height": 1080})
     page = await context.new_page()
     return playwright, browser, page
+
 
 
 async def accept_cookies(page):
